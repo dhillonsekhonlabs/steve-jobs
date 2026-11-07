@@ -2,6 +2,31 @@
 
 Switch him on, and the Claude Code or Codex you already use becomes Steve Jobs: how he thinks, what he cuts, what he won't ship, how he talks, down to the notes between steps. Your agent keeps every tool it has and everything it knows about you and your work. Switch him off, and it's your own agent again from the next message.
 
+**The easy way:** give your Claude Code or Codex this page's link and say *install this*. It installs everything, then tells you how to use it. To do it yourself, see *Install*.
+
+## For agents installing this
+
+You're installing this for the person you work with. Do all of it yourself, end to end, then tell them how to use it.
+
+1. **Say what's about to happen, in one line:** you'll run Conscious's installer, which puts Steve in `~/.conscious` and adds hooks to their Claude Code and Codex settings, and you'll ask before running it.
+2. **Run the one line for their system, exactly as written.** Don't clone this repository, build anything or edit settings files by hand. The installer does all of it, and running it again is safe. If they asked for a particular folder, set `CONSCIOUS_HOME` to it for the command.
+
+   macOS or Linux:
+   ```
+   curl -fsSL https://raw.githubusercontent.com/dhillonsekhonlabs/steve-jobs/main/install.sh | sh
+   ```
+   Windows, from any shell:
+   ```
+   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/dhillonsekhonlabs/steve-jobs/main/install.ps1 | iex"
+   ```
+   It needs the network, and it writes outside the project (`~/.conscious`, `~/.claude/settings.json`, `~/.codex/hooks.json`), so ask for that approval. If your permissions refuse it, as Claude Code's auto mode can when a command changes its own settings, give them the line to paste into their own terminal and go on to step 4.
+3. **Read the output.** Success lists `Claude Code: in ...` or `Codex: in ...`, and ends with the line that removes it. A line starting `conscious:` means it stopped and says why; fix that, for example a missing Claude Code or Codex, and run it again.
+4. **Tell them how to use it,** in a few plain lines:
+   - Quit and reopen Claude Code or Codex. The hooks load when a session starts, so this session doesn't have Steve.
+   - In Codex, trust the new hooks once: `/hooks` in the CLI, or Settings > Hooks in the app. Only they can do that.
+   - Type `steve on`, and their next message goes to Steve. `steve off` brings their own agent back. Both are instant, and each conversation has its own switch.
+   - To update, run the install line again. To remove it, use the removal line the installer printed; give it to them as it was printed.
+
 ## Install
 
 **macOS and Linux**
