@@ -1,0 +1,8 @@
+# Conscious ships scripts that must run on macOS and Linux as well as Windows.
+# A CRLF on a shebang line makes the kernel look for an interpreter named
+# "node\r", and the command dies on every non-Windows machine.
+# So committed line endings are LF, whoever commits.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zip binary
