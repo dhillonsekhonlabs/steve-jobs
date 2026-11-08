@@ -1,18 +1,23 @@
 #!/usr/bin/env node
-// Conscious: the one program behind every mind. Each agent's own hooks run it on every message.
-// It decides nothing about the mind. It flips the switch, hands the agent the mind's core and the
-// map of its life when the mind arrives, and keeps one line in front of the agent on every message
-// after that. What the mind remembers is the agent's own call: it opens the pages it needs with its
-// own tools, the way it reads any file. No model call, no network, nothing but small files.
+// Conscious: the one program behind every mind. It puts the mind where the agent is told who it is,
+// in place of the agent's own identity, and flips it with "steve on" and "steve off".
 //
-//   node conscious.mjs hook claude-code|codex [map]   what the hooks run (JSON on stdin)
-//   node conscious.mjs show [mind]                    what the agent is handed when the mind arrives
-//   node conscious.mjs check                          the brain's health: core, map, pages, links
+// Claude Code: the mind is an output style, the role slot of Claude Code's system prompt. "steve on"
+// selects it for the project you're in, and Claude Code uses it from your next message, in the
+// conversation you're in; "steve off" puts back whatever was there. Measured on 2026-11-08: a style
+// switched in a project's settings takes effect on the next message of a running conversation.
+//
+// Codex: the mind is the model instructions file, which replaces Codex's own instructions ("You are
+// Codex...") in every chat that starts while he's on. A chat that was already open gets him from its
+// next message, as developer context, and keeps him until "steve off".
+//
+//   node conscious.mjs hook claude-code|codex   what the hooks run (JSON on stdin)
+//   node conscious.mjs show [mind] [--codex] [--sizes]   what the agent is given in place of itself
+//   node conscious.mjs check                    the brain's health: identity, map, pages, links
 //   node conscious.mjs install [claude-code|codex] [--node <path>]
 //   node conscious.mjs uninstall [claude-code|codex] [--all]   --all also removes the install folder
 //
-// Switching is per conversation: "steve on" changes the conversation it is typed in and no other,
-// so a second window, a background job or a headless run never meets him unasked.
+// No model call, no network. A hook that fails prints nothing and lets the message through.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -22,21 +27,24 @@ import { fileURLToPath } from "node:url";
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = path.resolve(path.dirname(SELF), "..");
 const MINDS = path.join(ROOT, "minds");
-// Installed, the program lives in <home>/app beside the switch files, wherever the person put it.
-// Run from a checkout, it keeps them in ~/.conscious.
+// Installed, the program lives in <home>/app, wherever the person put it. Run from a checkout, its
+// files go in ~/.conscious.
 const HOME =
   process.env.CONSCIOUS_HOME ||
   (path.basename(ROOT) === "app" ? path.dirname(ROOT) : path.join(os.homedir(), ".conscious"));
 const MARK = path.join(HOME, ".conscious-home"); // only a folder with this in it is ever removed whole
-const SESSIONS = path.join(HOME, "sessions");
-const HANDOFF = path.join(HOME, "handoff");
+const STATE = path.join(HOME, "state.json");
+const CODEX_DIR = path.join(HOME, "codex"); // each mind's Codex instructions, rendered at install
 
-// Claude Code hands a hook's text to the model whole up to 10,000 characters, and turns anything
-// longer into a file the model has to go and read. So the core and the map travel separately,
-// each in a hand-off of its own, and each must stay under this.
-export const LIMIT = 9800;
-// Codex counts tokens and takes the core and the map together in one hand-off.
-export const CODEX_LIMIT = 6000;
+const AGENT_HOME = process.env.CONSCIOUS_AGENT_HOME || os.homedir();
+const CLAUDE_SETTINGS = path.join(AGENT_HOME, ".claude", "settings.json");
+const CLAUDE_STYLES = path.join(AGENT_HOME, ".claude", "output-styles");
+const CODEX_HOOKS = path.join(AGENT_HOME, ".codex", "hooks.json");
+const CODEX_CONFIG = path.join(AGENT_HOME, ".codex", "config.toml");
+
+// Codex sends long hook text to a file and shows the model a preview, past 2,500 tokens by default.
+// The identity is about 7,000; this is the room a chat that was already open needs to receive it whole.
+export const CODEX_LIMIT = 12000;
 const SWITCH = /^\s*\/?([a-z][\w-]*)(?:\s+mode)?\s+(on|off)[\s.!]*$/i;
 const KINDS = { life: "life", works: "work" }; // page folders, and the kind each one holds
 
@@ -54,41 +62,48 @@ function readJSON(file) {
   const text = read(file);
   if (text === null) return null;
   try {
-    return JSON.parse(text);
+    return JSON.parse(text.replace(/^﻿/, ""));
   } catch {
     return null;
   }
 }
 
-// Written whole or not at all, so a switch file is never left half-saved.
-function writeJSON(file, value) {
+// Written whole or not at all: a temporary file, then a rename.
+function write(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value));
+  fs.writeFileSync(tmp, text);
   try {
     fs.renameSync(tmp, file);
   } catch {
-    fs.writeFileSync(file, JSON.stringify(value));
+    fs.writeFileSync(file, text);
     fs.rmSync(tmp, { force: true });
   }
 }
 
-// The end of a file, where the latest of a conversation is.
-function tail(file, max = 16 * 1024 * 1024) {
+// Settings files are written the way Claude Code writes them, two spaces, so a switch changes one line.
+const writeSettings = (file, value) => write(file, JSON.stringify(value, null, 2) + "\n");
+
+// The first line of a file, which in a Codex transcript records the instructions the chat began with.
+function firstLine(file, max = 1024 * 1024) {
   let fd;
   try {
     fd = fs.openSync(file, "r");
-    const size = fs.fstatSync(fd).size;
-    const start = Math.max(0, size - max);
-    const buf = Buffer.alloc(size - start);
-    fs.readSync(fd, buf, 0, buf.length, start);
-    return buf.toString("utf8");
+    const buf = Buffer.alloc(Math.min(max, fs.fstatSync(fd).size));
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    const text = buf.subarray(0, n).toString("utf8");
+    const end = text.indexOf("\n");
+    return end < 0 ? text : text.slice(0, end);
   } catch {
     return null;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
 }
+
+const same = (a, b) =>
+  process.platform === "win32" ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
+const slashes = (p) => p.replace(/\\/g, "/");
 
 // ---------------------------------------------------------------- minds
 
@@ -109,45 +124,51 @@ function minds() {
 
 const mindBySwitch = (word) => minds().find((m) => m.switch?.toLowerCase() === word) ?? null;
 
-// Where the mind's pages are, written the way every agent's file tools take a path.
-const pagesAt = (mind) => mind.dir.replace(/\\/g, "/");
-export const core = (mind) => (read(path.join(mind.dir, "core.md")) ?? "").trim();
-// A helper can open the pages too, when its job needs one of the mind's specifics.
-export const helpers = (mind) =>
-  (read(path.join(mind.dir, "helpers.md")) ?? "").trim().replaceAll("{pages}", `${pagesAt(mind)}/`);
+// The first words of every rendered identity, which is how a Codex chat begun as a mind is known.
+export const marker = (mind) => `You are ${mind.name}.`;
 
-// The map is the mind's whole life, one line per page, and how its memory works, with exactly
-// where each page is, so the agent can open, follow and search any of them with its own tools.
-const mapMark = (mind) => `The map of ${mind.name}'s life.`;
-export function mapText(mind) {
-  const body = (read(path.join(mind.dir, "map.md")) ?? "").trim();
-  if (!body) return "";
-  const where = pagesAt(mind);
-  const ex = /^([a-z]+\/[\w-]+):\s/m.exec(body)?.[1] ?? "life/page";
+// Every page of the mind's life, chapter by chapter: map.md from its first chapter heading on.
+export function mapBody(mind) {
+  const lines = (read(path.join(mind.dir, "map.md")) ?? "").replace(/\r\n/g, "\n").split("\n");
+  const start = lines.findIndex((l) => /^##\s/.test(l) && !/memory/i.test(l));
+  return lines.slice(start < 0 ? 0 : start + 1).join("\n").trim();
+}
+
+// Who the agent is while the mind is on: the identity, with where its pages are and the map of them.
+// Codex also gets how its own machinery works, since its own instructions are gone.
+export function render(mind, agent = "claude-code") {
+  const identity = (read(path.join(mind.dir, "identity.md")) ?? "").replace(/\r\n/g, "\n").trim();
+  if (!identity) return "";
+  let text = identity.replaceAll("{{MIND_DIR}}", slashes(mind.dir)).replaceAll("{{MAP}}", mapBody(mind)).trim();
+  if (agent === "codex") text += "\n\n" + (read(path.join(ROOT, "bin", "codex.md")) ?? "").replace(/\r\n/g, "\n").trim();
+  return text + "\n";
+}
+
+const styleFile = (mind) => path.join(CLAUDE_STYLES, `conscious-${mind.id}.md`);
+const codexFile = (mind) => path.join(CODEX_DIR, `${mind.id}.md`);
+
+export function styleText(mind) {
   return (
-    `${mapMark(mind)} Every page is a file in ${where}/: a line's path with .md on the end, so ${ex} ` +
-    `is ${where}/${ex}.md. A page's links are paths in the same folder, and the folder can be searched.\n\n${body}`
+    `---\nname: ${mind.name}\ndescription: ${mind.name}, the whole person, in place of the agent's own identity (Conscious)\n` +
+    `keep-coding-instructions: true\n---\n\n${render(mind, "claude-code")}`
   );
 }
 
-const arrival = (agent, mind) =>
-  // Codex takes everything in one hand-off; in Claude Code the map comes from a second hook.
-  agent === "codex" ? [core(mind), mapText(mind)].filter(Boolean).join("\n\n") : core(mind);
+// ---------------------------------------------------------------- state
+
+// Which projects Steve is on in for Claude Code, with the style each had before, so off puts it back;
+// which mind is on for Codex, with the instructions file it replaced; and the open Codex chats that
+// were given the mind as developer context.
+const fresh = () => ({ v: 3, claude: {}, codex: null, threads: {}, sessions: {} });
+
+function loadState() {
+  const s = readJSON(STATE);
+  return s && s.v === 3 ? { ...fresh(), ...s } : fresh();
+}
+
+const saveState = (s) => write(STATE, JSON.stringify(s));
 
 // ---------------------------------------------------------------- what the agent is told
-
-export const lines = {
-  on: (mind) =>
-    `${mind.name} is on in this session. Everything said, written or shown here is ${mind.short}'s, ` +
-    `down to the short notes between steps.`,
-  back: (mind) =>
-    `${mind.name} is switched on again in this session. Everything above about ${mind.short} applies ` +
-    `again, and everything said, written or shown here is ${mind.short}'s.`,
-  off: (name) =>
-    `${name} is switched off in this session. This agent is itself again: its own name, voice and ` +
-    `formatting, as its instructions describe. Replies above written as ${name.split(" ")[0]} were ` +
-    `that mode, so none of their voice carries forward, and it isn't mentioned unless the person asks.`,
-};
 
 function out(value) {
   process.stdout.write(JSON.stringify(value));
@@ -157,235 +178,205 @@ function say(event, text) {
   if (text) out({ hookSpecificOutput: { hookEventName: event, additionalContext: text } });
 }
 
+// The switch never reaches a model: the agent shows the notice, and nothing answers.
 function block(agent, reason) {
   const value = { decision: "block", reason };
-  // Claude Code would otherwise repeat the words under the notice.
-  if (agent === "claude-code") {
-    value.hookSpecificOutput = { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true };
-  }
+  if (agent === "claude-code") value.hookSpecificOutput = { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true };
   out(value);
 }
 
-// ---------------------------------------------------------------- the switch
+export const lines = {
+  on: (mind) => `${mind.name} is on. You are him, in every word, down to the short notes while you work.`,
+  back: (mind) =>
+    `${mind.name} is switched on again. From this message on you are him again, in every word; whatever above ` +
+    `said he had been switched off no longer holds.`,
+  off: (mind) =>
+    `${mind.name} has been switched off. From this message on you are not ${mind.short}: you are this person's own ` +
+    `agent again, with your own name and voice, and nothing of his carries forward unless they ask.`,
+};
 
-function sessionFile(agent, id) {
-  return path.join(SESSIONS, `${agent}-${String(id ?? "none").replace(/[^\w-]/g, "")}.json`);
-}
+// ---------------------------------------------------------------- Claude Code
 
-// on: the mind switched on here. heard: the mind whose words are in this conversation's history.
-// core: the mind whose core and map a turn that really ran has seen. back: switched on again with
-// that still in the history. pending: what the last message carried, waiting for its turn's Stop.
-const fresh = () => ({ v: 2, on: null, name: null, heard: null, core: null, back: false, pending: null });
+// The project's own settings, where Claude Code's /output-style keeps a choice. A hook is told the
+// project's folder; the conversation's folder stands in when it isn't.
+const projectSettings = (input) =>
+  path.join(process.env.CLAUDE_PROJECT_DIR || input.cwd || process.cwd(), ".claude", "settings.local.json");
 
-function readState(file) {
-  const s = readJSON(file);
-  if (!s || typeof s !== "object") return null;
-  return {
-    ...fresh(),
-    on: s.on ?? null,
-    name: s.name ?? null,
-    heard: s.heard ?? null,
-    core: s.core ?? null,
-    back: !!s.back,
-    pending: s.pending ?? null,
-  };
-}
-
-// What this program tells a conversation is saved in the conversation's transcript. A conversation
-// with no switch file of its own still carries those words: a branch, a fork, a conversation moved
-// to the background, a resumed one whose file is gone. The last of them says which mind is in it,
-// and whether he was last on or off.
-export function fromTranscript(transcript) {
-  const text = transcript ? tail(transcript) : null;
-  if (!text) return null;
-  let best = null;
-  for (const mind of minds()) {
-    const first = core(mind).split("\n")[0].slice(0, 60);
-    const on = Math.max(
-      text.lastIndexOf(lines.on(mind).split(". ")[0]),
-      text.lastIndexOf(lines.back(mind).split(". ")[0]),
-      text.lastIndexOf(mapMark(mind)),
-      first ? text.lastIndexOf(first) : -1,
-    );
-    const off = text.lastIndexOf(lines.off(mind.name).split(". ")[0]);
-    const at = Math.max(on, off);
-    if (at >= 0 && (!best || at > best.at)) best = { at, mind, on: on > off };
-  }
-  if (!best) return null;
-  const { mind, on } = best;
-  return on
-    ? { ...fresh(), on: mind.id, name: mind.name, heard: mind.name, core: mind.id }
-    : { ...fresh(), heard: mind.name };
-}
-
-function flip(agent, input, file, mind, on) {
-  const known = readState(file);
-  const state = known ?? fromTranscript(input.transcript_path) ?? fresh();
-  const found = !known && (state.on || state.heard);
-  state.pending = null;
+export function claudeSwitch(file, mind, on, state = loadState()) {
+  const exists = fs.existsSync(file);
+  const config = exists ? readJSON(file) : {};
+  if (config === null || typeof config !== "object" || Array.isArray(config)) return "unreadable";
+  const key = path.resolve(file);
+  const record = Object.entries(state.claude).find(([k]) => same(k, key))?.[1];
   if (on) {
-    if (state.on === mind.id) {
-      // Said again, the whole of him comes back with the next message: after a rewind dropped
-      // the message that carried him, or whenever he feels faint.
-      Object.assign(state, { core: null, back: false });
-    } else {
-      Object.assign(state, { on: mind.id, name: mind.name, back: state.core === mind.id });
-    }
-    writeJSON(file, state);
-    return block(agent, `${mind.short} is on.`);
-  }
-  // Off always works, whatever this program remembers: from the next message the agent is itself.
-  if (state.on === mind.id) {
-    state.on = null;
-    writeJSON(file, state);
-  } else if (found) {
-    writeJSON(file, state);
-  }
-  return block(agent, `${mind.short} is off.`);
-}
-
-function onPrompt(agent, input, file, part) {
-  const prompt = String(input.prompt ?? "");
-  const word = prompt.length < 40 ? SWITCH.exec(prompt) : null;
-  const switched = word ? mindBySwitch(word[1].toLowerCase()) : null;
-  if (switched) {
-    if (part === "map") return; // the switch belongs to the main hook
-    return flip(agent, input, file, switched, word[2].toLowerCase() === "on");
-  }
-  const state = readState(file);
-  if (!state) return; // never switched on here: the agent is untouched, and this is all it cost
-  if (part === "map") {
-    // The second hand-off carries the map, on the message that carries the core.
-    if (state.on && state.core !== state.on) {
-      const mind = meta(state.on);
-      if (mind) say("UserPromptSubmit", mapText(mind));
-    }
-    return;
-  }
-  if (!state.on) {
-    // His words stay in the history after he leaves, so the conversation hears it every turn.
-    if (state.heard) say("UserPromptSubmit", lines.off(state.heard));
-    return;
-  }
-  const mind = meta(state.on);
-  if (!mind) return; // the mind's folder is gone: stay out of the way
-  let text;
-  let back = false;
-  if (state.core !== mind.id) {
-    text = arrival(agent, mind);
-  } else if (state.back) {
-    text = lines.back(mind);
-    back = true;
+    if (!record) {
+      const folder = !fs.existsSync(path.dirname(file));
+      state.claude[key] = { mind: mind.id, previous: config.outputStyle ?? null, created: !exists, folder };
+    } else record.mind = mind.id;
+    config.outputStyle = mind.name;
   } else {
-    // Every other message opens with one line, so he is in front of the agent where a long run
-    // of steps begins, not only far above.
-    text = lines.on(mind);
+    if (!record && config.outputStyle !== mind.name) return "already";
+    if (record?.previous) config.outputStyle = record.previous;
+    else delete config.outputStyle;
+    for (const k of Object.keys(state.claude)) if (same(k, key)) delete state.claude[k];
   }
-  state.heard = mind.name;
-  state.pending = { core: mind.id, back };
-  writeJSON(file, state);
-  say("UserPromptSubmit", text);
+  if (!on && record?.created && !Object.keys(config).length) {
+    // The project goes back to exactly what it was: no settings file, and no .claude folder if he made it.
+    fs.rmSync(file, { force: true });
+    try {
+      if (record.folder && !fs.readdirSync(path.dirname(file)).length) fs.rmdirSync(path.dirname(file));
+    } catch {}
+  } else writeSettings(file, config);
+  saveState(state);
+  return "done";
 }
 
-// A message counts as seen only when its turn has run. One stopped before the model answered,
-// and edited, is thrown away by the agent, and so is whatever it carried.
-function onStop(agent, input, file) {
-  const state = readState(file);
-  const p = state?.pending;
-  if (!p) return;
-  Object.assign(state, { core: p.core, back: p.back ? false : state.back, pending: null });
-  writeJSON(file, state);
-}
-
-function onStart(agent, input, file, part) {
-  const source = input.source;
-  if (part === "map") {
-    // After a compaction the map goes back in beside the core.
-    if (source !== "compact") return;
-    const state = readState(file);
-    const mind = state?.on ? meta(state.on) : null;
-    if (mind) say("SessionStart", mapText(mind));
-    return;
-  }
-  if (source === "resume" || source === "fork") {
-    // A resumed conversation still holds what it was told. A branch is a new conversation with
-    // the old one's history, and the switch follows it there.
-    if (readState(file)) return;
-    const found = fromTranscript(input.transcript_path);
-    if (found) writeJSON(file, found);
-    return;
-  }
-  if (source === "clear") {
-    // A cleared conversation may come back with a new id; the old one left its switch behind.
-    const state = readState(file) ?? takeHandoff(agent, input.cwd);
-    if (!state) return;
-    Object.assign(state, { heard: null, core: null, back: false, pending: null });
-    return writeJSON(file, state); // the core and the map go with the next message
-  }
-  if (source !== "compact") return;
-  const state = readState(file);
-  if (!state) return;
-  Object.assign(state, { core: null, back: false, pending: null });
-  if (state.on) {
-    const mind = meta(state.on);
+// A conversation's own history pulls the model back into whoever it has been answering as, whatever
+// the system prompt now says (measured 2026-11-08: switched off, the next answer was still "Steve").
+// So a conversation that had the mind is told on every message once he's gone, and told again
+// when he comes back. Each conversation the hook sees while he's on is remembered for that.
+function claudeMessage(input, state) {
+  const settings = path.resolve(projectSettings(input));
+  const onHere = Object.entries(state.claude).find(([k]) => same(k, settings))?.[1];
+  const id = `claude-code:${input.session_id ?? ""}`;
+  const seen = state.sessions[id];
+  if (onHere) {
+    const mind = meta(onHere.mind);
     if (!mind) return;
-    // Compaction drops what the earlier turns were told, and the agent may go on mid-turn, so now.
-    state.core = mind.id;
-    writeJSON(file, state);
-    return say("SessionStart", arrival(agent, mind));
+    if (!seen) {
+      state.sessions[id] = { mind: mind.id, was: "on", at: Date.now() };
+      prune(state.sessions, 500);
+      return saveState(state);
+    }
+    if (seen.was === "on" && seen.mind === mind.id) return;
+    if (seen.was !== "back" || seen.mind !== mind.id) {
+      state.sessions[id] = { mind: mind.id, was: "back", at: Date.now() };
+      saveState(state);
+    }
+    return say("UserPromptSubmit", lines.back(mind));
   }
-  writeJSON(file, state);
-  if (state.heard) say("SessionStart", lines.off(state.heard));
+  if (!seen) return;
+  const had = meta(seen.mind);
+  if (!had) return;
+  if (seen.was !== "off") {
+    state.sessions[id] = { ...seen, was: "off", at: Date.now() };
+    saveState(state);
+  }
+  say("UserPromptSubmit", lines.off(had));
 }
 
-function onEnd(agent, input, file) {
-  // Claude Code says why a session ended. Codex says only "other", so there any end counts, and
-  // the handoff is still taken only by a cleared conversation starting within seconds, here.
-  if (agent === "claude-code" && input.reason !== "clear") return;
-  const state = readState(file);
-  if (state?.on) {
-    writeJSON(path.join(HANDOFF, `${agent}.json`), {
-      on: state.on,
-      name: state.name,
-      cwd: input.cwd ?? null,
-      at: Date.now(),
-    });
-  }
+// ---------------------------------------------------------------- Codex
+
+const tomlString = (s) => JSON.stringify(slashes(s));
+const KEY = /^\s*model_instructions_file\s*=/;
+
+// config.toml's top-level keys come before its first [table], so the line is looked for, and put, there.
+export function codexInstructions(text, value) {
+  const lines = (text ?? "").split(/\r?\n/);
+  const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
+  const top = firstTable < 0 ? lines.length : firstTable;
+  const at = lines.slice(0, top).findIndex((l) => KEY.test(l));
+  const current = at < 0 ? null : lines[at];
+  let next = [...lines];
+  if (value === null) {
+    if (at >= 0) next.splice(at, 1);
+  } else if (at >= 0) next[at] = value;
+  else next = [value, ...lines];
+  const joined = next.join(text?.includes("\r\n") ? "\r\n" : "\n");
+  return { current, text: joined.length && !joined.endsWith("\n") ? joined + "\n" : joined };
 }
 
-function takeHandoff(agent, cwd) {
-  const file = path.join(HANDOFF, `${agent}.json`);
-  const left = readJSON(file);
-  if (!left) return null;
-  fs.rmSync(file, { force: true });
-  if (Date.now() - left.at > 30_000 || (left.cwd ?? null) !== (cwd ?? null)) return null;
-  return { ...fresh(), on: left.on, name: left.name };
+const ourLine = (line) => !!line && /conscious/i.test(line) && /model_instructions_file/.test(line);
+
+export function codexSwitch(mind, on, state = loadState()) {
+  const exists = fs.existsSync(CODEX_CONFIG);
+  const text = exists ? read(CODEX_CONFIG) : "";
+  if (text === null) return "unreadable";
+  const { current } = codexInstructions(text, null);
+  if (on) {
+    const line = `model_instructions_file = ${tomlString(codexFile(mind))}`;
+    if (!state.codex) state.codex = { mind: mind.id, previous: ourLine(current) ? null : current, created: !exists };
+    else state.codex.mind = mind.id;
+    write(CODEX_CONFIG, codexInstructions(text, line).text);
+  } else {
+    if (!state.codex && !ourLine(current)) return "already";
+    const previous = state.codex?.previous ?? null;
+    const restored = codexInstructions(text, ourLine(current) || current === null ? previous : current).text;
+    if (state.codex?.created && !restored.trim()) fs.rmSync(CODEX_CONFIG, { force: true });
+    else write(CODEX_CONFIG, restored);
+    state.codex = null;
+  }
+  saveState(state);
+  return "done";
 }
 
-function onSubagent(agent, input, file) {
-  const state = readState(file);
-  const mind = state?.on ? meta(state.on) : null;
-  if (mind) say("SubagentStart", helpers(mind));
+// The mind a Codex chat began as, read from the instructions its transcript opens with.
+export function bornAs(transcript) {
+  const line = transcript ? firstLine(transcript) : null;
+  if (!line) return null;
+  let text = "";
+  try {
+    const first = JSON.parse(line);
+    const base = first?.payload?.base_instructions;
+    text = typeof base === "string" ? base : base?.text ?? "";
+  } catch {
+    return null;
+  }
+  return minds().find((m) => text.trimStart().startsWith(marker(m)))?.id ?? null;
 }
 
-export function hook(agent, input, part = null) {
-  const file = sessionFile(agent, input.session_id);
-  switch (input.hook_event_name) {
-    case "UserPromptSubmit":
-      return onPrompt(agent, input, file, part);
-    case "SessionStart":
-      return onStart(agent, input, file, part);
+// A Codex chat that began without the mind gets him, once, as developer context, and a line on every
+// message after; one that began as him needs nothing. Off, a chat that had him is told he left.
+function codexMessage(input, event, state) {
+  const on = state.codex ? meta(state.codex.mind) : null;
+  const born = bornAs(input.transcript_path);
+  const id = String(input.session_id ?? "");
+  const given = state.threads[id]?.mind ?? null;
+  const fromStart = event === "SessionStart"; // a compacted, resumed or cleared chat has lost what it was given
+  if (on) {
+    if (born === on.id) return;
+    if (given !== on.id || fromStart) {
+      state.threads[id] = { mind: on.id, at: Date.now() };
+      prune(state.threads, 200);
+      saveState(state);
+      return say(event, `${render(on, "claude-code")}\n${lines.on(on)}`);
+    }
+    return say(event, lines.on(on));
   }
-  if (part) return; // the map hook has nothing to say at any other moment
-  switch (input.hook_event_name) {
-    case "SubagentStart":
-      return onSubagent(agent, input, file);
-    case "SessionEnd":
-      return onEnd(agent, input, file);
-    case "Stop":
-    case "StopFailure": // a turn that died on an error still left its message in the history
-      return onStop(agent, input, file);
+  const had = meta(born ?? given ?? "");
+  if (had) say(event, lines.off(had));
+}
+
+function prune(records, keep) {
+  const ids = Object.keys(records).sort((a, b) => (records[b].at ?? 0) - (records[a].at ?? 0));
+  for (const id of ids.slice(keep)) delete records[id];
+}
+
+// ---------------------------------------------------------------- the hook
+
+export function hook(agent, input) {
+  const event = input.hook_event_name ?? "UserPromptSubmit";
+  const state = loadState();
+  if (event === "UserPromptSubmit") {
+    const hit = SWITCH.exec(input.prompt ?? "");
+    const mind = hit ? mindBySwitch(hit[1].toLowerCase()) : null;
+    if (mind) {
+      const on = hit[2].toLowerCase() === "on";
+      const result = agent === "claude-code" ? claudeSwitch(projectSettings(input), mind, on, state) : codexSwitch(mind, on, state);
+      if (result === "unreadable") {
+        const file = agent === "claude-code" ? projectSettings(input) : CODEX_CONFIG;
+        return block(agent, `${mind.name} can't be switched ${on ? "on" : "off"}: ${file} couldn't be read, so it was left alone.`);
+      }
+      if (agent === "codex" && on) {
+        // The chat this was typed in gets him from its next message; the switch itself answers nothing.
+        delete state.threads[String(input.session_id ?? "")];
+        saveState(state);
+      }
+      return block(agent, `${mind.name} is ${on ? "on" : "off"}.`);
+    }
   }
+  if (agent === "codex") codexMessage(input, event, state);
+  else if (event === "UserPromptSubmit") claudeMessage(input, state);
 }
 
 // ---------------------------------------------------------------- show and check
@@ -427,6 +418,8 @@ function pages(mind) {
   return list;
 }
 
+const tokens = (text) => Math.ceil(text.length / 4);
+
 function show(args) {
   const id = args.find((a) => !a.startsWith("--")) ?? "steve-jobs";
   const mind = meta(id);
@@ -435,13 +428,14 @@ function show(args) {
     process.exitCode = 1;
     return;
   }
-  const c = core(mind);
-  const m = mapText(mind);
-  if (!args.includes("--sizes")) console.log(`${c}\n\n${m}\n`);
+  const agent = args.includes("--codex") ? "codex" : "claude-code";
+  const text = render(mind, agent);
+  if (!args.includes("--sizes")) console.log(text);
+  const c = render(mind, "claude-code");
+  const x = render(mind, "codex");
   console.log(
-    `core ${c.length.toLocaleString("en")} characters, map ${m.length.toLocaleString("en")}, ` +
-      `each under Claude Code's ${LIMIT.toLocaleString("en")}; together about ` +
-      `${Math.ceil((c.length + m.length) / 4).toLocaleString("en")} tokens, under Codex's ${CODEX_LIMIT.toLocaleString("en")}`,
+    `Claude Code: ${c.length.toLocaleString("en")} characters, about ${tokens(c).toLocaleString("en")} tokens. ` +
+      `Codex: ${x.length.toLocaleString("en")} characters, about ${tokens(x).toLocaleString("en")} tokens.`,
   );
 }
 
@@ -450,14 +444,16 @@ export function checkMind(id) {
   const mind = meta(id);
   if (!mind) return { mind: null, problems: [`minds/${id}: mind.json is missing or has no name`], list: [] };
   if (!mind.switch) problems.push("mind.json has no switch word");
-  const c = core(mind);
-  const m = mapText(mind);
-  if (!c) problems.push("core.md is missing or empty");
-  if (c.length > LIMIT) problems.push(`core.md is ${c.length} characters, over the ${LIMIT} one hand-off takes`);
-  if (!m) problems.push("map.md is missing or empty");
-  if (m.length > LIMIT) problems.push(`the map is ${m.length} characters, over the ${LIMIT} one hand-off takes`);
-  if (Math.ceil((c.length + m.length) / 4) > CODEX_LIMIT) problems.push(`core and map together are over Codex's ${CODEX_LIMIT} tokens`);
-  if (!helpers(mind)) problems.push("helpers.md is missing or empty");
+  const identity = read(path.join(mind.dir, "identity.md")) ?? "";
+  if (!identity.trim()) problems.push("identity.md is missing or empty");
+  else {
+    if (!identity.trimStart().startsWith(marker(mind))) problems.push(`identity.md doesn't open with "${marker(mind)}"`);
+    if (!identity.includes("{{MIND_DIR}}")) problems.push("identity.md never says where the pages are ({{MIND_DIR}})");
+    if (!identity.includes("{{MAP}}")) problems.push("identity.md has no place for the map ({{MAP}})");
+  }
+  const rendered = render(mind, "claude-code");
+  if (tokens(rendered) > CODEX_LIMIT * 0.9) problems.push(`the identity is about ${tokens(rendered)} tokens, too close to the ${CODEX_LIMIT} an open Codex chat takes`);
+  if (!mapBody(mind)) problems.push("map.md is missing or empty");
 
   let list = [];
   try {
@@ -506,7 +502,7 @@ export function checkMind(id) {
     if (n > 1) problems.push(`map.md: ${rel} is on the map ${n} times`);
   }
   for (const p of list) if (!onMap.has(p.rel)) problems.push(`map.md: ${p.rel} is missing`);
-  return { mind, problems, list, core: c, map: m };
+  return { mind, problems, list, rendered };
 }
 
 function check() {
@@ -516,28 +512,20 @@ function check() {
   } catch {}
   let bad = 0;
   for (const id of dirs) {
-    const { mind, problems, list, core: c = "", map: m = "" } = checkMind(id);
+    const { mind, problems, list, rendered = "" } = checkMind(id);
     const n = (folder) => list.filter((p) => p.folder === folder).length;
-    const links = list.map((p) => p.links.length).sort((a, b) => a - b);
     console.log(
       `${mind?.name ?? id}: ${list.length} pages (${n("life")} memories, ${n("works")} works), ` +
-        `core ${c.length.toLocaleString("en")} characters, map ${m.length.toLocaleString("en")}` +
-        (links.length ? `, links per page ${links[0]}-${links.at(-1)}` : ""),
+        `identity about ${tokens(rendered).toLocaleString("en")} tokens with the map`,
     );
     for (const p of problems) console.log(`  ${p}`);
-    if (!problems.length) console.log("  every page is well formed and on the map, and every page reaches every other");
+    if (!problems.length) console.log("  the identity is whole, every page is well formed and on the map, and every page reaches every other");
     bad += problems.length;
   }
   process.exitCode = bad ? 1 : 0;
 }
 
 // ---------------------------------------------------------------- install
-
-const AGENT_HOME = process.env.CONSCIOUS_AGENT_HOME || os.homedir();
-const AGENT_FILES = {
-  "claude-code": path.join(AGENT_HOME, ".claude", "settings.json"),
-  codex: path.join(AGENT_HOME, ".codex", "hooks.json"),
-};
 
 function ours(handler) {
   return [handler.command, ...(handler.args ?? [])].some((x) => String(x).includes("conscious.mjs"));
@@ -548,7 +536,7 @@ function ours(handler) {
 // one rule that lets it read the minds folder and nothing else: no edits, no other paths. Paths in
 // rules are written from the filesystem root after //, and Windows drives as /e/..., per its docs.
 export function readRule(dir = MINDS) {
-  const p = dir.replace(/\\/g, "/").replace(/^([A-Za-z]):/, (_, d) => `/${d.toLowerCase()}`);
+  const p = slashes(dir).replace(/^([A-Za-z]):/, (_, d) => `/${d.toLowerCase()}`);
   return `Read(/${p.startsWith("/") ? "" : "/"}${p.replace(/\/+$/, "")}/**)`;
 }
 const ourRule = (rule) =>
@@ -569,101 +557,109 @@ function grant(config, remove) {
 }
 
 function hooksFor(agent, node) {
-  const script = SELF.replace(/\\/g, "/");
+  const script = slashes(SELF);
   if (agent === "claude-code") {
     // Exec form: Node runs straight away, without a shell starting first, and by its exact path,
-    // so the hooks work where PATH has no node, as in an app opened from the dock.
-    const h = (timeout, part) => ({
-      type: "command",
-      command: node,
-      args: [script, "hook", agent, ...(part ? [part] : [])],
-      timeout,
-    });
-    return {
-      UserPromptSubmit: [{ hooks: [h(10), h(10, "map")] }],
-      SessionStart: [
-        { matcher: "resume|clear|compact|fork", hooks: [h(10)] },
-        { matcher: "compact", hooks: [h(10, "map")] },
-      ],
-      SessionEnd: [{ matcher: "clear", hooks: [h(5)] }],
-      SubagentStart: [{ hooks: [h(10)] }],
-      Stop: [{ hooks: [h(10)] }],
-      StopFailure: [{ hooks: [h(10)] }],
-    };
+    // so the hook works where PATH has no node, as in an app opened from the dock.
+    return { UserPromptSubmit: [{ hooks: [{ type: "command", command: node, args: [script, "hook", agent], timeout: 10 }] }] };
   }
   // Codex runs a hook through a shell, and only a bare first word works in every shell, so a Node
   // whose path has a space in it goes by name.
   const bare = /\s/.test(node) ? "node" : process.platform === "win32" ? node.replace(/\//g, "\\") : node;
-  const h = (timeout, limit) => ({
-    type: "command",
-    command: `${bare} "${script}" hook ${agent}`,
-    timeout,
-    ...(limit ? { additionalContextLimit: limit } : {}),
-  });
+  const h = { type: "command", command: `${bare} "${script}" hook ${agent}`, timeout: 10, additionalContextLimit: CODEX_LIMIT };
   return {
-    UserPromptSubmit: [{ hooks: [h(10, CODEX_LIMIT)] }],
-    SessionStart: [{ matcher: "^(resume|clear|compact|fork)$", hooks: [h(10, CODEX_LIMIT)] }],
-    SessionEnd: [{ hooks: [h(3)] }], // Codex allows a session's end three seconds at most
-    SubagentStart: [{ hooks: [h(10, 1000)] }],
-    Stop: [{ hooks: [h(10)] }],
+    UserPromptSubmit: [{ hooks: [h] }],
+    // A chat that was compacted, resumed, cleared or forked is given the mind again.
+    SessionStart: [{ matcher: "^(resume|clear|compact|fork)$", hooks: [h] }],
   };
 }
 
 const NAMES = { "claude-code": "Claude Code", codex: "Codex" };
+const AGENT_FILES = { "claude-code": CLAUDE_SETTINGS, codex: CODEX_HOOKS };
+
+function setHooks(file, agent, node, remove) {
+  const config = readJSON(file) ?? (fs.existsSync(file) ? null : {});
+  if (config === null) {
+    console.log(`${NAMES[agent]}: ${file} isn't valid JSON, so it was left alone`);
+    process.exitCode = 1;
+    return false;
+  }
+  config.hooks ??= {};
+  for (const event of Object.keys(config.hooks)) {
+    config.hooks[event] = config.hooks[event]
+      .map((group) => ({ ...group, hooks: (group.hooks ?? []).filter((h) => !ours(h)) }))
+      .filter((group) => group.hooks.length);
+    if (!config.hooks[event].length) delete config.hooks[event];
+  }
+  if (!remove) {
+    for (const [event, groups] of Object.entries(hooksFor(agent, node))) {
+      config.hooks[event] = [...(config.hooks[event] ?? []), ...groups];
+    }
+  }
+  if (!Object.keys(config.hooks).length) delete config.hooks;
+  if (agent === "claude-code") grant(config, remove);
+  if (remove && !Object.keys(config).length) fs.rmSync(file, { force: true }); // nothing in it but what install left
+  else writeSettings(file, config);
+  return true;
+}
 
 function install(agents, { remove = false, node = process.execPath } = {}) {
   let done = 0;
+  const state = loadState();
   for (const agent of agents) {
     const file = AGENT_FILES[agent];
     if (!fs.existsSync(path.dirname(file))) {
       if (!remove) console.log(`${NAMES[agent]}: not on this machine`);
       continue;
     }
-    const config = readJSON(file) ?? (fs.existsSync(file) ? null : {});
-    if (config === null) {
-      console.log(`${NAMES[agent]}: ${file} isn't valid JSON, so it was left alone`);
-      process.exitCode = 1;
-      continue;
-    }
-    config.hooks ??= {};
-    for (const event of Object.keys(config.hooks)) {
-      config.hooks[event] = config.hooks[event]
-        .map((group) => ({ ...group, hooks: (group.hooks ?? []).filter((h) => !ours(h)) }))
-        .filter((group) => group.hooks.length);
-      if (!config.hooks[event].length) delete config.hooks[event];
-    }
-    if (!remove) {
-      for (const [event, groups] of Object.entries(hooksFor(agent, node))) {
-        config.hooks[event] = [...(config.hooks[event] ?? []), ...groups];
+    if (remove) {
+      // Every project and config he was switched on in goes back to what it was.
+      if (agent === "claude-code") {
+        for (const [settings, record] of Object.entries(state.claude)) {
+          const mind = meta(record.mind) ?? { id: record.mind, name: record.mind };
+          if (fs.existsSync(settings) || record.created) claudeSwitch(settings, mind, false, state);
+        }
+        state.claude = {};
+        state.sessions = {};
+        for (const mind of minds()) fs.rmSync(styleFile(mind), { force: true });
+      } else {
+        const mind = meta(state.codex?.mind ?? "") ?? minds()[0];
+        if (mind) codexSwitch(mind, false, state);
+        state.threads = {};
+        fs.rmSync(CODEX_DIR, { recursive: true, force: true });
+      }
+      if (fs.existsSync(path.dirname(STATE))) saveState(state);
+    } else {
+      for (const mind of minds()) {
+        if (agent === "claude-code") write(styleFile(mind), styleText(mind));
+        else write(codexFile(mind), render(mind, "codex"));
       }
     }
-    if (!Object.keys(config.hooks).length) delete config.hooks;
-    // Codex reads files through its shell, which its sandbox never stops from reading.
-    if (agent === "claude-code") grant(config, remove);
-    if (remove && !Object.keys(config).length) {
-      fs.rmSync(file, { force: true }); // a settings file with nothing in it is only what install left
-    } else {
-      fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n");
-    }
+    if (!setHooks(file, agent, node, remove)) continue;
     done++;
     if (remove) {
       console.log(`${NAMES[agent]}: taken out of ${file}`);
       continue;
     }
     console.log(`${NAMES[agent]}: in ${file}`);
-    if (agent === "claude-code") console.log(`  its pages open without a permission prompt: ${readRule()}`);
-    if (agent === "codex") console.log("  trust it once: /hooks in the CLI, or Settings > Hooks in the app");
+    if (agent === "claude-code") {
+      console.log(`  ${minds().map((m) => m.name).join(", ")} in ${CLAUDE_STYLES}`);
+      console.log(`  pages open without a permission prompt: ${readRule()}`);
+    } else {
+      console.log(`  ${minds().map((m) => m.name).join(", ")} in ${CODEX_DIR}`);
+      console.log("  trust it once: /hooks in the CLI, or Settings > Hooks in the app");
+    }
   }
   if (!remove && done) {
     fs.mkdirSync(HOME, { recursive: true });
-    fs.writeFileSync(MARK, "Conscious keeps its switch files here. `uninstall --all` removes this folder.\n");
+    fs.writeFileSync(MARK, "Conscious keeps its files here. `uninstall --all` removes this folder.\n");
     const word = minds()[0]?.switch ?? "steve";
-    console.log(`\nIn a new session, type "${word} on". "${word} off" gives you your own agent back.`);
+    console.log(`\nOpen a new session and type "${word} on". "${word} off" gives you your own agent back.`);
   }
   return done;
 }
 
-// Leaves nothing behind: the switch files, the program and its brains, and a Node it brought.
+// Leaves nothing behind: the program and its brains, its files, and a Node it brought.
 // Only a folder that install marked is ever removed.
 async function removeHome() {
   if (!fs.existsSync(MARK)) {
@@ -698,7 +694,7 @@ if (isMain) {
     // A broken conscious must never stand between a person and their agent: fail silent, open.
     try {
       const input = JSON.parse(fs.readFileSync(0, "utf8").replace(/^﻿/, ""));
-      hook(args[0] === "codex" ? "codex" : "claude-code", input, args[1] === "map" ? "map" : null);
+      hook(args[0] === "codex" ? "codex" : "claude-code", input);
     } catch (error) {
       process.stderr.write(`conscious: ${error?.message ?? error}\n`);
     }
@@ -722,7 +718,7 @@ if (isMain) {
     if (remove && args.includes("--all")) await removeHome();
   } else {
     console.log(
-      "conscious hook claude-code|codex [map]  |  show [mind] [--sizes]  |  check  |  " +
+      "conscious hook claude-code|codex  |  show [mind] [--codex] [--sizes]  |  check  |  " +
         "install [claude-code|codex] [--node <path>]  |  uninstall [claude-code|codex] [--all]",
     );
   }
